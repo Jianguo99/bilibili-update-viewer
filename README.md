@@ -100,3 +100,7 @@ bilibili-update-viewer/
 ## License
 
 MIT
+
+## 致谢
+
+本项目基于 [bilibili-hot-monitor](https://clawhub.ai/Jacobzwj/bilibili-hot-monitor) 的 B站 API 封装进行开发，感谢原作者的贡献。
