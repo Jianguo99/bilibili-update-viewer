@@ -16,6 +16,7 @@ B站 API 工具集
 
 import hashlib
 import json
+import random
 import time
 import urllib.parse
 from functools import reduce
@@ -36,6 +37,11 @@ MIXIN_KEY_ENC_TAB = [
 class BilibiliAPI:
     """B站 API 客户端"""
 
+    # 重试配置
+    MAX_RETRIES = 3
+    RETRY_BASE_DELAY = 2  # 基础重试延迟（秒）
+    REQUEST_INTERVAL = 1.0  # 请求间最小间隔（秒）
+
     def __init__(self, sessdata: str = "", bili_jct: str = "", buvid3: str = "", dedeuserid: str = "", all_cookies: dict = None):
         """
         初始化 API 客户端
@@ -49,9 +55,21 @@ class BilibiliAPI:
         """
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Referer": "https://www.bilibili.com",
+            "Origin": "https://www.bilibili.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
         })
+        self._last_request_time = 0
 
         # 如果提供了全部 cookies，直接设置
         if all_cookies:
@@ -72,6 +90,53 @@ class BilibiliAPI:
         self._img_key = ""
         self._sub_key = ""
 
+    def _throttle(self):
+        """控制请求频率，确保两次请求之间有足够间隔"""
+        now = time.time()
+        elapsed = now - self._last_request_time
+        if elapsed < self.REQUEST_INTERVAL:
+            sleep_time = self.REQUEST_INTERVAL - elapsed + random.uniform(0.1, 0.5)
+            time.sleep(sleep_time)
+        self._last_request_time = time.time()
+
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        """
+        带重试和频率控制的请求方法
+
+        遇到 -412（请求被拦截）或网络错误时自动重试，采用指数退避策略。
+        """
+        last_exception = None
+        for attempt in range(self.MAX_RETRIES):
+            self._throttle()
+            try:
+                resp = self.session.request(method, url, **kwargs)
+                data = resp.json()
+
+                # -412 表示请求被拦截（频率限制）
+                if data.get("code") == -412:
+                    delay = self.RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0.5, 1.5)
+                    print(f"  [INFO] 请求被频率限制，{delay:.1f}秒后重试 ({attempt + 1}/{self.MAX_RETRIES})...")
+                    time.sleep(delay)
+                    continue
+
+                return resp
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exception = e
+                delay = self.RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0.5, 1.5)
+                print(f"  [INFO] 网络错误，{delay:.1f}秒后重试 ({attempt + 1}/{self.MAX_RETRIES})...")
+                time.sleep(delay)
+            except Exception as e:
+                raise e
+
+        # 所有重试用尽
+        if last_exception:
+            raise last_exception
+        raise Exception("请求过于频繁，请稍后再试（已重试多次仍失败）")
+
+    def _get(self, url: str, **kwargs) -> requests.Response:
+        """带重试的 GET 请求"""
+        return self._request_with_retry("GET", url, **kwargs)
+
     def _get_mixin_key(self, orig: str) -> str:
         """生成混淆后的密钥"""
         return reduce(lambda s, i: s + orig[i], MIXIN_KEY_ENC_TAB, '')[:32]
@@ -81,7 +146,7 @@ class BilibiliAPI:
         if self._img_key and self._sub_key:
             return self._img_key, self._sub_key
 
-        resp = self.session.get("https://api.bilibili.com/x/web-interface/nav")
+        resp = self._get("https://api.bilibili.com/x/web-interface/nav")
         data = resp.json()
 
         if data["code"] != 0:
@@ -126,7 +191,7 @@ class BilibiliAPI:
         Returns:
             视频信息
         """
-        resp = self.session.get(
+        resp = self._get(
             "https://api.bilibili.com/x/web-interface/view",
             params={"bvid": bvid}
         )
@@ -159,7 +224,7 @@ class BilibiliAPI:
                 return None
 
         # 使用 wbi/v2 API（与 bilibili_subtitle.py 一致）
-        resp = self.session.get(
+        resp = self._get(
             "https://api.bilibili.com/x/player/wbi/v2",
             params={"aid": aid, "cid": cid}
         )
@@ -189,7 +254,7 @@ class BilibiliAPI:
             subtitle_url = "https:" + subtitle_url
 
         try:
-            resp = self.session.get(subtitle_url)
+            resp = self._get(subtitle_url)
             data = resp.json()
             return data.get("body", [])
         except Exception as e:
@@ -258,9 +323,10 @@ class BilibiliAPI:
         # 该接口需要 WBI 签名
         signed_params = self._sign_params(params)
 
-        resp = self.session.get(
+        resp = self._get(
             "https://api.bilibili.com/x/space/wbi/arc/search",
-            params=signed_params
+            params=signed_params,
+            headers={"Referer": f"https://space.bilibili.com/{mid}/"}
         )
         data = resp.json()
 
@@ -279,9 +345,10 @@ class BilibiliAPI:
         Returns:
             UP主信息字典
         """
-        resp = self.session.get(
+        resp = self._get(
             "https://api.bilibili.com/x/space/acc/info",
-            params={"mid": mid}
+            params={"mid": mid},
+            headers={"Referer": f"https://space.bilibili.com/{mid}/"}
         )
         data = resp.json()
 
@@ -309,7 +376,7 @@ class BilibiliAPI:
             "page_size": page_size,
         }
 
-        resp = self.session.get(
+        resp = self._get(
             "https://api.bilibili.com/x/web-interface/search/type",
             params=params
         )
@@ -335,9 +402,10 @@ class BilibiliAPI:
         if offset:
             params["offset"] = offset
 
-        resp = self.session.get(
+        resp = self._get(
             "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-            params=params
+            params=params,
+            headers={"Referer": f"https://space.bilibili.com/{mid}/"}
         )
         data = resp.json()
 
